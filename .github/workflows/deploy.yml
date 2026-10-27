@@ -1,137 +1,93 @@
-
-name: Build and deploy SayHello API
+name: Deploy Flask App
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
 
-permissions:
-  contents: read
-
-# Never cancel a deployment that is already running.
 concurrency:
-  group: sayhello-production
+  group: deploy
   cancel-in-progress: false
 
 jobs:
   deploy:
-    name: Validate and deploy to Ubuntu VM
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
-      - name: Check out repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - name: Remove files not needed on the server
+        run: rm -rf .git .github
+
+      - name: Copy files to VM (new release dir)
+        uses: appleboy/scp-action@v0.1.7
         with:
-          node-version: "20"
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "."
+          target: "~/hello-api/releases/${{ github.sha }}"
 
-      - name: Validate application and deployment script
-        run: |
-          set -eu
+      - name: Deploy on VM (zero downtime)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
 
-          test -s server.js
-          test -s package.json
-          test -s install-remote.sh
+            APP="$HOME/hello-api"
+            REL="$APP/releases/${{ github.sha }}"
+            UPSTREAM=/etc/nginx/conf.d/hello-api-upstream.conf
 
-          node --check server.js
-          node -e "const p=require('./package.json'); if (!p.scripts || !p.scripts.start) { console.error('Missing start script in package.json'); process.exit(1); }"
+            mkdir -p "$APP/slots"
 
-          bash -n install-remote.sh
+            # 1. Build the new release
+            cd "$REL"
+            python3 -m venv venv
+            ./venv/bin/pip install --quiet --upgrade pip
+            ./venv/bin/pip install --quiet -r requirements.txt
 
-      - name: Prepare deployment bundle
-        run: |
-          set -eu
-          tar -czf deploy-bundle.tar.gz server.js package.json
-          test -s deploy-bundle.tar.gz
+            # 2. Pick the idle slot
+            CURRENT=$(grep -oP '127\.0\.0\.1:\K[0-9]+' "$UPSTREAM" || echo 8002)
+            if [ "$CURRENT" = "8001" ]; then NEW=8002; else NEW=8001; fi
+            echo "Active: $CURRENT -> deploying to: $NEW"
 
-      - name: Configure SSH
-        env:
-          VM_SSH_KEY: ${{ secrets.VM_SSH_KEY }}
-          VM_KNOWN_HOSTS: ${{ secrets.VM_KNOWN_HOSTS }}
-        run: |
-          set -eu
+            # 3. Start the new version on the idle slot (no live traffic yet)
+            ln -sfn "$REL" "$APP/slots/$NEW"
+            sudo systemctl restart "hello-api@$NEW"
 
-          test -n "$VM_SSH_KEY" || {
-            echo "VM_SSH_KEY secret is missing."
-            exit 1
-          }
+            # 4. Health check before switching traffic
+            healthy=0
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:$NEW/health" > /dev/null; then
+                healthy=1; break
+              fi
+              sleep 1
+            done
+            if [ "$healthy" != "1" ]; then
+              echo "New version failed health check. Old version still serving."
+              sudo journalctl -u "hello-api@$NEW" -n 50 --no-pager || true
+              sudo systemctl stop "hello-api@$NEW" || true
+              exit 1
+            fi
 
-          test -n "$VM_KNOWN_HOSTS" || {
-            echo "VM_KNOWN_HOSTS secret is missing."
-            exit 1
-          }
+            # 5. Switch nginx (graceful reload; in-flight requests finish)
+            sudo cp "$UPSTREAM" "$UPSTREAM.bak" 2>/dev/null || true
+            echo "upstream hello_api { server 127.0.0.1:$NEW; }" | sudo tee "$UPSTREAM" > /dev/null
+            if ! sudo nginx -t; then
+              sudo cp "$UPSTREAM.bak" "$UPSTREAM"
+              echo "nginx config test failed, rolled back"
+              exit 1
+            fi
+            sudo nginx -s reload
 
-          mkdir -p "$HOME/.ssh"
-          chmod 700 "$HOME/.ssh"
+            # 6. Drain, then stop the old instance
+            sleep 10
+            sudo systemctl stop "hello-api@$CURRENT" || true
 
-          printf '%s\n' "$VM_SSH_KEY" > "$HOME/.ssh/deploy_key"
-          chmod 600 "$HOME/.ssh/deploy_key"
-
-          printf '%s\n' "$VM_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-      - name: Validate SSH configuration
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-        run: |
-          set -eu
-
-          test -n "$VM_HOST" || {
-            echo "VM_HOST secret is missing."
-            exit 1
-          }
-
-          test -n "$VM_USER" || {
-            echo "VM_USER secret is missing."
-            exit 1
-          }
-
-          ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null
-
-      - name: Transfer release files to VM
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          RELEASE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -eu
-
-          scp \
-            -i "$HOME/.ssh/deploy_key" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            deploy-bundle.tar.gz \
-            "$VM_USER@$VM_HOST:/tmp/sayhello-${RELEASE_ID}.tar.gz"
-
-          scp \
-            -i "$HOME/.ssh/deploy_key" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            install-remote.sh \
-            "$VM_USER@$VM_HOST:/tmp/sayhello-install-${RELEASE_ID}.sh"
-
-      - name: Install release with health-checked traffic switch
-        env:
-          VM_HOST: ${{ secrets.VM_HOST }}
-          VM_USER: ${{ secrets.VM_USER }}
-          RELEASE_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -eu
-
-          ssh \
-            -i "$HOME/.ssh/deploy_key" \
-            -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=yes \
-            "$VM_USER@$VM_HOST" \
-            "sudo bash /tmp/sayhello-install-${RELEASE_ID}.sh /tmp/sayhello-${RELEASE_ID}.tar.gz ${RELEASE_ID}"
-
-      - name: Remove temporary SSH key
-        if: always()
-        run: |
-          rm -f "$HOME/.ssh/deploy_key"
+            # 7. Keep only the 3 most recent releases
+            ls -dt "$APP"/releases/* | tail -n +4 | xargs -r rm -rf
