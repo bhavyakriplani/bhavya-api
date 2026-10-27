@@ -1,28 +1,42 @@
 name: Deploy Flask App
+
 on:
   push:
     branches:
       - main
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-* name: Copy files to VM
-uses: appleboy/scp-action@v0.1.7
-with:
-  host: ${{ secrets.VM_HOST }}
-  username: ${{ secrets.VM_USER }}
-  key: ${{ secrets.VM_SSH_KEY }}
-  source: "."
-  target: "~/hello-api"
-* name: Deploy on VM
-uses: appleboy/ssh-action@v1.0.3
-with:
-  host: ${{ secrets.VM_HOST }}
-  username: ${{ secrets.VM_USER }}
-  key: ${{ secrets.VM_SSH_KEY }}
-  script: |
-    cd ~/hello-api
+      - name: Copy files to VM
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          source: "."
+          target: "~/hello-api"
+
+      - name: Deploy on VM
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            cd ~/hello-api
+
+            python3 -m venv venv || true
+
+            source venv/bin/activate
+
+            pip install -r requirements.txt
+
+            pkill gunicorn || true
+
+            nohup ./venv/bin/gunicorn -b 0.0.0.0:80 app:app > gunicorn.log 2>&1 &
