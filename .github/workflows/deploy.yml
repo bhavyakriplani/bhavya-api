@@ -1,3 +1,4 @@
+
 name: Deploy Flask App
 
 on:
@@ -22,7 +23,73 @@ jobs:
           source: "."
           target: "~/hello-api"
 
-      - name: Deploy on VM
+      - name: Prepare zero-downtime deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+
+            # Prepare the alternate Gunicorn instance.
+            cd ~/hello-api
+
+            python3 -m venv venv || true
+            source venv/bin/activate
+            pip install -r requirements.txt
+
+            mkdir -p releases
+            RELEASE_ID=$(date +%Y%m%d%H%M%S)
+            RELEASE_DIR="$HOME/hello-api/releases/$RELEASE_ID"
+
+            mkdir -p "$RELEASE_DIR"
+            cp app.py requirements.txt "$RELEASE_DIR/"
+            cp -r ./*.py "$RELEASE_DIR/" 2>/dev/null || true
+
+            if [ -d templates ]; then
+              cp -r templates "$RELEASE_DIR/"
+            fi
+
+            if [ -d static ]; then
+              cp -r static "$RELEASE_DIR/"
+            fi
+
+            python3 -m venv "$RELEASE_DIR/venv"
+            "$RELEASE_DIR/venv/bin/pip" install -r "$RELEASE_DIR/requirements.txt"
+
+            # Start the replacement on a separate port.
+            NEW_PORT=8001
+            OLD_PORT=8000
+
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              NEW_PORT=8001
+              OLD_PORT=8000
+            else
+              NEW_PORT=8000
+              OLD_PORT=8001
+            fi
+
+            cd "$RELEASE_DIR"
+
+            nohup "$RELEASE_DIR/venv/bin/gunicorn" \
+              --workers 2 \
+              --bind "127.0.0.1:$NEW_PORT" \
+              --pid "$RELEASE_DIR/gunicorn.pid" \
+              app:app > "$RELEASE_DIR/gunicorn.log" 2>&1 &
+
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:$NEW_PORT/health" >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            curl -fsS "http://127.0.0.1:$NEW_PORT/health" >/dev/null
+
+            echo "Replacement instance is healthy on port $NEW_PORT"
+
+      - name: Original deployment commands (preserved)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
@@ -40,3 +107,23 @@ jobs:
             pkill gunicorn || true
 
             nohup ./venv/bin/gunicorn -b 0.0.0.0:80 app:app > gunicorn.log 2>&1 &
+
+      - name: Verify deployment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1/health >/dev/null 2>&1; then
+                echo "Application health check passed"
+                exit 0
+              fi
+              sleep 2
+            done
+
+            echo "Application health check failed"
+            exit 1
