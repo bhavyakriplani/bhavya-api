@@ -26,6 +26,7 @@ jobs:
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
+            set -e
             cd ~/hello-api
             python3 -m venv venv
             source venv/bin/activate
