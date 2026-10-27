@@ -10,25 +10,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Copy files to VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          source: "."
-          target: "~/hello-api"
-
-      - name: Deploy on VM
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          script: |
-            set -e
-            cd ~/hello-api
-            python3 -m venv venv
-            source venv/bin/activate
-            pip install -r requirements.txt
-            sudo systemctl reload hello-api
+* name: Copy files to VM
+uses: appleboy/scp-action@v0.1.7
+with:
+  host: ${{ secrets.VM_HOST }}
+  username: ${{ secrets.VM_USER }}
+  key: ${{ secrets.VM_SSH_KEY }}
+  source: "."
+  target: "~/hello-api"
+* name: Deploy on VM
+uses: appleboy/ssh-action@v1.0.3
+with:
+  host: ${{ secrets.VM_HOST }}
+  username: ${{ secrets.VM_USER }}
+  key: ${{ secrets.VM_SSH_KEY }}
+  script: |
+    cd ~/hello-api
