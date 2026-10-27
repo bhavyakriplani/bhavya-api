@@ -1,93 +1,33 @@
 name: Deploy Flask App
-
 on:
   push:
     branches:
       - main
-
-concurrency:
-  group: deploy
-  cancel-in-progress: false
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Remove files not needed on the server
-        run: rm -rf .git .github
-
-      - name: Copy files to VM (new release dir)
+      - name: Copy files to VM
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           source: "."
-          target: "~/hello-api/releases/${{ github.sha }}"
+          target: "~/hello-api"
 
-      - name: Deploy on VM (zero downtime)
+      - name: Deploy on VM
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
-          script_stop: true
           script: |
-            set -euo pipefail
-
-            APP="$HOME/hello-api"
-            REL="$APP/releases/${{ github.sha }}"
-            UPSTREAM=/etc/nginx/conf.d/hello-api-upstream.conf
-
-            mkdir -p "$APP/slots"
-
-            # 1. Build the new release
-            cd "$REL"
+            cd ~/hello-api
             python3 -m venv venv
-            ./venv/bin/pip install --quiet --upgrade pip
-            ./venv/bin/pip install --quiet -r requirements.txt
-
-            # 2. Pick the idle slot
-            CURRENT=$(grep -oP '127\.0\.0\.1:\K[0-9]+' "$UPSTREAM" || echo 8002)
-            if [ "$CURRENT" = "8001" ]; then NEW=8002; else NEW=8001; fi
-            echo "Active: $CURRENT -> deploying to: $NEW"
-
-            # 3. Start the new version on the idle slot (no live traffic yet)
-            ln -sfn "$REL" "$APP/slots/$NEW"
-            sudo systemctl restart "hello-api@$NEW"
-
-            # 4. Health check before switching traffic
-            healthy=0
-            for i in $(seq 1 30); do
-              if curl -fsS "http://127.0.0.1:$NEW/health" > /dev/null; then
-                healthy=1; break
-              fi
-              sleep 1
-            done
-            if [ "$healthy" != "1" ]; then
-              echo "New version failed health check. Old version still serving."
-              sudo journalctl -u "hello-api@$NEW" -n 50 --no-pager || true
-              sudo systemctl stop "hello-api@$NEW" || true
-              exit 1
-            fi
-
-            # 5. Switch nginx (graceful reload; in-flight requests finish)
-            sudo cp "$UPSTREAM" "$UPSTREAM.bak" 2>/dev/null || true
-            echo "upstream hello_api { server 127.0.0.1:$NEW; }" | sudo tee "$UPSTREAM" > /dev/null
-            if ! sudo nginx -t; then
-              sudo cp "$UPSTREAM.bak" "$UPSTREAM"
-              echo "nginx config test failed, rolled back"
-              exit 1
-            fi
-            sudo nginx -s reload
-
-            # 6. Drain, then stop the old instance
-            sleep 10
-            sudo systemctl stop "hello-api@$CURRENT" || true
-
-            # 7. Keep only the 3 most recent releases
-            ls -dt "$APP"/releases/* | tail -n +4 | xargs -r rm -rf
+            source venv/bin/activate
+            pip install -r requirements.txt
+            sudo systemctl reload hello-api
